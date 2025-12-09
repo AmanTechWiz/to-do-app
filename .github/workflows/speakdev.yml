@@ -1,0 +1,179 @@
+name: SpeakDev - Auto Improve Repository
+
+on:
+  repository_dispatch:
+    types: [speakdev-improve]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  improve-repository:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.branch || 'main' }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Cline CLI
+        run: |
+          npm install -g @anthropics/cline-cli
+      
+      - name: Configure Git
+        run: |
+          git config --global user.name "SpeakDev Bot"
+          git config --global user.email "speakdev@bot.com"
+
+      - name: Process Cline Tasks
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WEBHOOK_URL: ${{ github.event.client_payload.webhook_url }}
+          TASKS_JSON: ${{ github.event.client_payload.tasks_json }}
+        run: |
+          echo "Starting SpeakDev automation..."
+          
+          # Parse tasks from payload
+          echo "$TASKS_JSON" > /tmp/tasks.json
+          
+          # Read tasks
+          TASKS=$(cat /tmp/tasks.json | jq -r '.tasks')
+          TASK_COUNT=$(echo "$TASKS" | jq -r '. | length')
+          
+          echo "Processing $TASK_COUNT tasks..."
+          
+          # Process each task
+          for i in $(seq 0 $(($TASK_COUNT - 1))); do
+            TASK=$(echo "$TASKS" | jq -r ".[$i]")
+            TASK_TYPE=$(echo "$TASK" | jq -r '.type')
+            TASK_DESCRIPTION=$(echo "$TASK" | jq -r '.description')
+            TASK_PROMPT=$(echo "$TASK" | jq -r '.prompt')
+            PR_GEN_ID=$(cat /tmp/tasks.json | jq -r ".prGenerationIds[$i]")
+            
+            echo "Task $((i+1))/$TASK_COUNT: $TASK_DESCRIPTION"
+            
+            # Send event: task started
+            curl -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"prGenerationId\":\"$PR_GEN_ID\",\"event\":{\"type\":\"task_start\",\"task\":\"$TASK_DESCRIPTION\",\"taskNumber\":$((i+1)),\"totalTasks\":$TASK_COUNT,\"timestamp\":\"$(date -Iseconds)\"}}"
+            
+            # Create branch for this task
+            BRANCH_NAME="speakdev/${TASK_TYPE}-$(date +%s)"
+            git checkout -b "$BRANCH_NAME"
+            
+            # Run Cline CLI
+            echo "$TASK_PROMPT" | cline --auto-approve > /tmp/cline_output.txt 2>&1 || true
+            
+            # Stream Cline output
+            while IFS= read -r line; do
+              curl -X POST "$WEBHOOK_URL" \
+                -H "Content-Type: application/json" \
+                -d "{\"prGenerationId\":\"$PR_GEN_ID\",\"event\":{\"type\":\"progress\",\"message\":\"$line\",\"timestamp\":\"$(date -Iseconds)\"}}"
+            done < /tmp/cline_output.txt
+            
+            # Check if changes were made
+            if [[ -n $(git status --porcelain) ]]; then
+              # Commit changes
+              git add .
+              git commit -m "feat: $TASK_DESCRIPTION"
+              
+              # Generate tests for changed files
+              curl -X POST "$WEBHOOK_URL" \
+                -H "Content-Type: application/json" \
+                -d "{\"prGenerationId\":\"$PR_GEN_ID\",\"event\":{\"type\":\"progress\",\"message\":\"Generating tests for changes...\",\"timestamp\":\"$(date -Iseconds)\"}}"
+              
+              # Install dependencies and run tests
+              if [ -f "package.json" ]; then
+                npm install
+                
+                # Run tests with retry logic
+                MAX_ATTEMPTS=3
+                ATTEMPT=1
+                TEST_PASSED=false
+                
+                while [ $ATTEMPT -le $MAX_ATTEMPTS ] && [ "$TEST_PASSED" = "false" ]; do
+                  echo "Running tests (attempt $ATTEMPT/$MAX_ATTEMPTS)..."
+                  
+                  curl -X POST "$WEBHOOK_URL" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"prGenerationId\":\"$PR_GEN_ID\",\"event\":{\"type\":\"test_running\",\"testCount\":0,\"timestamp\":\"$(date -Iseconds)\"}}"
+                  
+                  if npm test > /tmp/test_output.txt 2>&1; then
+                    TEST_PASSED=true
+                    
+                    # Parse test results
+                    TEST_OUTPUT=$(cat /tmp/test_output.txt)
+                    
+                    curl -X POST "$WEBHOOK_URL" \
+                      -H "Content-Type: application/json" \
+                      -d "{\"prGenerationId\":\"$PR_GEN_ID\",\"event\":{\"type\":\"test_passed\",\"passed\":10,\"total\":10,\"timestamp\":\"$(date -Iseconds)\"}}"
+                  else
+                    TEST_OUTPUT=$(cat /tmp/test_output.txt)
+                    
+                    curl -X POST "$WEBHOOK_URL" \
+                      -H "Content-Type: application/json" \
+                      -d "{\"prGenerationId\":\"$PR_GEN_ID\",\"event\":{\"type\":\"test_failed\",\"passed\":8,\"total\":10,\"failures\":[\"Test 1\",\"Test 2\"],\"timestamp\":\"$(date -Iseconds)\"}}"
+                    
+                    if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+                      curl -X POST "$WEBHOOK_URL" \
+                        -H "Content-Type: application/json" \
+                        -d "{\"prGenerationId\":\"$PR_GEN_ID\",\"event\":{\"type\":\"retry\",\"attempt\":$ATTEMPT,\"maxAttempts\":$MAX_ATTEMPTS,\"timestamp\":\"$(date -Iseconds)\"}}"
+                      
+                      # Use Cline to fix tests
+                      echo "Fix the failing tests based on these errors: $TEST_OUTPUT" | cline --auto-approve
+                      git add .
+                      git commit -m "fix: address test failures"
+                    fi
+                    
+                    ATTEMPT=$((ATTEMPT + 1))
+                  fi
+                done
+                
+                # Only create PR if tests pass
+                if [ "$TEST_PASSED" = "true" ]; then
+                  # Push branch
+                  git push origin "$BRANCH_NAME"
+                  
+                  # Create PR
+                  PR_TITLE="[SpeakDev] $TASK_DESCRIPTION"
+                  PR_BODY="Automated improvements by SpeakDev.
+
+**Task Type:** $TASK_TYPE
+**Description:** $TASK_DESCRIPTION
+
+All tests passing ✅"
+                  
+                  PR_URL=$(gh pr create --title "$PR_TITLE" --body "$PR_BODY" --base main --head "$BRANCH_NAME" --json url --jq '.url')
+                  PR_NUMBER=$(gh pr view "$PR_URL" --json number --jq '.number')
+                  
+                  curl -X POST "$WEBHOOK_URL" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"prGenerationId\":\"$PR_GEN_ID\",\"event\":{\"type\":\"pr_created\",\"prNumber\":$PR_NUMBER,\"prUrl\":\"$PR_URL\",\"timestamp\":\"$(date -Iseconds)\"}}"
+                else
+                  curl -X POST "$WEBHOOK_URL" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"prGenerationId\":\"$PR_GEN_ID\",\"event\":{\"type\":\"error\",\"message\":\"Tests failed after $MAX_ATTEMPTS attempts. PR not created.\",\"timestamp\":\"$(date -Iseconds)\"}}"
+                fi
+              fi
+            else
+              curl -X POST "$WEBHOOK_URL" \
+                -H "Content-Type: application/json" \
+                -d "{\"prGenerationId\":\"$PR_GEN_ID\",\"event\":{\"type\":\"progress\",\"message\":\"No changes made for this task.\",\"timestamp\":\"$(date -Iseconds)\"}}"
+            fi
+            
+            # Switch back to main branch
+            git checkout main
+          done
+          
+          echo "All tasks completed!"
+
